@@ -1,257 +1,259 @@
-import requests
-from bs4 import BeautifulSoup
-from datetime import datetime, timedelta
-import pytz
-import json
 import os
+import requests
+from datetime import datetime, timezone, timedelta
+from textwrap import indent
 
-# --------------------------------------
-# SETTINGS
-# --------------------------------------
-IST = pytz.timezone("Asia/Kolkata")
-now = datetime.now(IST)
-one_hour_ago = now - timedelta(hours=1)
+# ========= CONFIG =========
 
-KEYWORDS = ["devops", "sre", "cloud", "platform", "infrastructure"]
-OUTPUT_DIR = "job_reports"
+JSEARCH_API_KEY = os.getenv("JSEARCH_API_KEY")
+JSEARCH_HOST = "jsearch.p.rapidapi.com"
 
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+SEARCH_QUERIES = [
+    "DevOps Engineer",
+    "Site Reliability Engineer",
+    "SRE",
+]
 
-# --------------------------------------
-# SCRAPER HELPER
-# --------------------------------------
-def keyword_match(text):
-    if not text:
-        return False
-    t = text.lower()
-    return any(k in t for k in KEYWORDS)
+LOCATION = "Bangalore, India"
 
-# --------------------------------------
-# 1) INDEED SCRAPER
-# --------------------------------------
-def scrape_indeed():
-    jobs = []
-    url = "https://in.indeed.com/jobs?q=devops&l=Bangalore&fromage=1"
+# How many hours back to keep (approx "last hours")
+MAX_JOB_AGE_HOURS = 6
 
-    r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"})
-    soup = BeautifulSoup(r.text, "html.parser")
+MAX_JOBS = 50
 
-    for card in soup.select("div.job_seen_beacon"):
-        title_el = card.select_one("h2 span")
-        company_el = card.select_one(".companyName")
-        link_el = card.select_one("a")
+# Set to ["LinkedIn"] if you want to EXCLUDE LinkedIn jobs
+EXCLUDED_PUBLISHERS = []  # e.g. ["LinkedIn"]
 
-        if not title_el or not company_el or not link_el:
-            continue
+# Keywords to roughly match your stack
+MUST_KEYWORDS = ["devops", "sre", "kubernetes", "aws", "docker", "terraform"]
 
-        title = title_el.text.strip()
-        company = company_el.text.strip()
-        link = "https://in.indeed.com" + link_el.get("href")
+CANDIDATE_NAME = "Abin"  # used in outreach messages
+OUTPUT_FILE = "jobs_report.txt"
 
-        # Time filter: only "Just posted" / "1 hour" / "Few minutes"
-        date_text = card.select_one(".date").text.lower()
+# ========= CORE FUNCTIONS =========
 
-        if not ("just" in date_text or "hour" in date_text or "minute" in date_text):
-            continue
 
-        if keyword_match(title):
-            jobs.append({
-                "title": title,
-                "company": company,
-                "location": "Bangalore",
-                "link": link,
-                "source": "Indeed"
-            })
+def fetch_jobs_from_jsearch(query: str, location: str):
+    """
+    Uses JSearch API via RapidAPI to fetch jobs.
+    Docs indicate /search endpoint with query + location. :contentReference[oaicite:1]{index=1}
+    """
+    if not JSEARCH_API_KEY:
+        raise RuntimeError(
+            "JSEARCH_API_KEY environment variable is not set. "
+            "Set it to your RapidAPI key for the JSearch API."
+        )
 
-    return jobs
+    url = f"https://{JSEARCH_HOST}/search"
+    headers = {
+        "X-RapidAPI-Key": JSEARCH_API_KEY,
+        "X-RapidAPI-Host": JSEARCH_HOST,
+    }
+    # We keep params simple; JSearch supports many filters.
+    params = {
+        "query": f"{query} in {location}",
+        "page": "1",
+        "num_pages": "1",
+        "date_posted": "today",  # we will post-filter by datetime
+    }
 
-# --------------------------------------
-# 2) LINKEDIN (public, limited)
-# --------------------------------------
-def scrape_linkedin():
-    jobs = []
-    url = ("https://www.linkedin.com/jobs/search/"
-           "?keywords=devops&location=Bangalore%2C%20Karnataka%2C%20India&f_TPR=r86400")
+    resp = requests.get(url, headers=headers, params=params, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("data", [])
 
-    r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"})
-    soup = BeautifulSoup(r.text, "html.parser")
 
-    for card in soup.select(".base-card"):
-        title_el = card.select_one(".base-search-card__title")
-        company_el = card.select_one(".base-search-card__subtitle")
-        link_el = card.select_one("a.base-card__full-link")
-
-        if not title_el or not company_el or not link_el:
-            continue
-
-        title = title_el.text.strip()
-        company = company_el.text.strip()
-        link = link_el.get("href")
-
-        if keyword_match(title):
-            jobs.append({
-                "title": title,
-                "company": company,
-                "location": "Bangalore",
-                "link": link,
-                "source": "LinkedIn"
-            })
-
-    return jobs
-
-# --------------------------------------
-# 3) ANGELLIST / WELLFOUND
-# --------------------------------------
-def scrape_angellist():
-    jobs = []
-    url = "https://wellfound.com/jobs?location=Bangalore&keywords=DevOps&remote=true"
-
-    r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"})
-    soup = BeautifulSoup(r.text, "html.parser")
-
-    for card in soup.select(".job-listing"):
-        title_el = card.select_one(".job-title")
-        company_el = card.select_one(".company-title")
-        link_el = card.select_one("a")
-
-        if not title_el or not company_el or not link_el:
-            continue
-
-        title = title_el.text.strip()
-        company = company_el.text.strip()
-        link = "https://wellfound.com" + link_el.get("href")
-
-        if keyword_match(title):
-            jobs.append({
-                "title": title,
-                "company": company,
-                "location": "Bangalore / Remote",
-                "link": link,
-                "source": "AngelList"
-            })
-
-    return jobs
-
-# --------------------------------------
-# 4) YC STARTUP JOBS (API)
-# --------------------------------------
-def scrape_yc():
-    jobs = []
-    url = "https://www.ycombinator.com/jobs/api/jobs?query=DevOps&Bangalore"
-
+def parse_posted_datetime(job: dict):
+    """
+    Parse job_posted_at_datetime_utc (if present) to datetime.
+    """
+    dt_str = job.get("job_posted_at_datetime_utc")
+    if not dt_str:
+        return None
     try:
-        r = requests.get(url)
-        data = r.json()
-    except:
-        return jobs
+        # Example format: "2024-07-05T12:36:32.000Z" :contentReference[oaicite:2]{index=2}
+        return datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+    except Exception:
+        return None
 
-    for item in data:
-        title = item.get("title", "")
-        if not keyword_match(title):
-            continue
 
-        jobs.append({
-            "title": item.get("title"),
-            "company": item.get("company_name"),
-            "location": item.get("location", "Unknown"),
-            "link": "https://ycombinator.com" + item.get("job_post_url", ""),
-            "source": "YCombinator"
-        })
+def is_recent(job: dict, max_age_hours: int) -> bool:
+    posted = parse_posted_datetime(job)
+    if not posted:
+        return False
+    now = datetime.now(timezone.utc)
+    return now - posted <= timedelta(hours=max_age_hours)
 
-    return jobs
 
-# --------------------------------------
-# 5) CUTSHORT
-# --------------------------------------
-def scrape_cutshort():
-    jobs = []
-    url = "https://cutshort.io/jobs/devops-jobs-in-bangalore"
+def matches_keywords(job: dict) -> bool:
+    text = (
+        (job.get("job_title") or "") + " " +
+        (job.get("job_description") or "")
+    ).lower()
+    return any(kw.lower() in text for kw in MUST_KEYWORDS)
 
-    r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"})
-    soup = BeautifulSoup(r.text, "html.parser")
 
-    for card in soup.select(".job-card"):
-        title_el = card.select_one(".job-title")
-        company_el = card.select_one(".h5")
-        link_el = card.select_one("a")
+def is_allowed_publisher(job: dict) -> bool:
+    publisher = (job.get("job_publisher") or "").strip()
+    return publisher not in EXCLUDED_PUBLISHERS
 
-        if not title_el or not company_el or not link_el:
-            continue
 
-        title = title_el.text.strip()
-        company = company_el.text.strip()
-        link = "https://cutshort.io" + link_el.get("href")
+def simplify_job(job: dict) -> dict:
+    return {
+        "title": job.get("job_title", "N/A"),
+        "company": job.get("employer_name", "N/A"),
+        "location": job.get("job_location", "N/A"),
+        "publisher": job.get("job_publisher", "N/A"),
+        "apply_link": job.get("job_apply_link")
+                       or job.get("job_google_link")
+                       or "#",
+        "description": job.get("job_description", ""),
+        "posted_utc": job.get("job_posted_at_datetime_utc", ""),
+    }
 
-        if keyword_match(title):
-            jobs.append({
-                "title": title,
-                "company": company,
-                "location": "Bangalore",
-                "link": link,
-                "source": "CutShort"
-            })
 
-    return jobs
-
-# --------------------------------------
-# OUTPUT FORMATS
-# --------------------------------------
-def save_txt(jobs):
-    with open(os.path.join(OUTPUT_DIR, "job_report.txt"), "w", encoding="utf-8") as f:
-        for j in jobs:
-            f.write(f"{j['title']} — {j['company']}\n")
-            f.write(f"Location: {j['location']}\n")
-            f.write(f"Apply: {j['link']}\n")
-            f.write(f"Source: {j['source']}\n")
-            f.write("-" * 60 + "\n")
-
-def save_md(jobs):
-    md = [f"# Daily DevOps/SRE Job Report\nGenerated: **{now}**\n\n"]
-    for j in jobs:
-        md.append(f"### 🔹 {j['title']} — {j['company']}")
-        md.append(f"- **Location:** {j['location']}")
-        md.append(f"- **Apply:** [{j['link']}]({j['link']})")
-        md.append(f"- **Source:** {j['source']}\n")
-    with open(os.path.join(OUTPUT_DIR, "job_report.md"), "w", encoding="utf-8") as f:
-        f.write("\n".join(md))
-
-def save_json(jobs):
-    with open(os.path.join(OUTPUT_DIR, "job_report.json"), "w", encoding="utf-8") as f:
-        json.dump(jobs, f, indent=4)
-
-def save_html(jobs):
-    html = ["<html><body><h2>Daily DevOps/SRE Job Report</h2>"]
-    for j in jobs:
-        html.append("<div style='padding:12px;border:1px solid #ccc;margin:10px;border-radius:8px;'>")
-        html.append(f"<h3>{j['title']} — {j['company']}</h3>")
-        html.append(f"<p><b>Location:</b> {j['location']}</p>")
-        html.append(f"<a href='{j['link']}'>Apply Here</a>")
-        html.append(f"<p><i>Source: {j['source']}</i></p></div>")
-    html.append("</body></html>")
-    with open(os.path.join(OUTPUT_DIR, "job_report.html"), "w", encoding="utf-8") as f:
-        f.write("\n".join(html))
-
-# --------------------------------------
-# MAIN
-# --------------------------------------
-def main():
-    print("Fetching jobs…")
-
+def collect_jobs():
     all_jobs = []
-    all_jobs += scrape_indeed()
-    all_jobs += scrape_linkedin()
-    all_jobs += scrape_angellist()
-    all_jobs += scrape_yc()
-    all_jobs += scrape_cutshort()
 
-    print(f"Found {len(all_jobs)} jobs.")
+    for q in SEARCH_QUERIES:
+        try:
+            jobs = fetch_jobs_from_jsearch(q, LOCATION)
+            all_jobs.extend(jobs)
+        except Exception as e:
+            print(f"[WARN] Failed to fetch for query '{q}': {e}")
 
-    save_txt(all_jobs)
-    save_md(all_jobs)
-    save_json(all_jobs)
-    save_html(all_jobs)
+    # Deduplicate by job_id if present
+    dedup = {}
+    for j in all_jobs:
+        job_id = j.get("job_id") or id(j)
+        dedup[job_id] = j
 
-    print(f"Reports saved to {OUTPUT_DIR}/")
+    jobs = list(dedup.values())
+
+    # Filter by recency, keywords, and publisher
+    filtered = [
+        j for j in jobs
+        if is_recent(j, MAX_JOB_AGE_HOURS)
+        and matches_keywords(j)
+        and is_allowed_publisher(j)
+    ]
+
+    # Simplify & trim
+    simplified = [simplify_job(j) for j in filtered]
+    return simplified[:MAX_JOBS]
+
+
+# ========= FORMATTING =========
+
+
+def generate_email_body(jobs):
+    if not jobs:
+        return (
+            "Subject: DevOps / SRE job digest – no fresh matches in the last "
+            f"{MAX_JOB_AGE_HOURS} hours\n\n"
+            f"No suitable DevOps / SRE roles were found for Bangalore in the last "
+            f"{MAX_JOB_AGE_HOURS} hours based on the current filters.\n"
+        )
+
+    subject = (
+        f"Subject: DevOps / SRE roles – last {MAX_JOB_AGE_HOURS}h – "
+        f"{len(jobs)} matches\n"
+    )
+
+    header = (
+        "Hi,\n\n"
+        "Here is your fresh DevOps / SRE job digest from the last "
+        f"{MAX_JOB_AGE_HOURS} hours for Bangalore:\n\n"
+    )
+
+    lines = []
+    for idx, job in enumerate(jobs, start=1):
+        desc_snippet = (job["description"] or "").strip().replace("\n", " ")
+        if len(desc_snippet) > 260:
+            desc_snippet = desc_snippet[:260].rsplit(" ", 1)[0] + "..."
+
+        lines.append(
+            f"{idx}. {job['title']} – {job['company']}\n"
+            f"   Location: {job['location']}\n"
+            f"   Publisher: {job['publisher']}\n"
+            f"   Posted (UTC): {job['posted_utc']}\n"
+            f"   Apply: {job['apply_link']}\n"
+            f"   Summary: {desc_snippet}\n"
+        )
+
+    footer = (
+        "\nRegards,\n"
+        "Your DevOps Job Bot\n"
+    )
+
+    return subject + "\n" + header + "\n".join(lines) + footer
+
+
+def generate_linkedin_messages(jobs, candidate_name=CANDIDATE_NAME):
+    """
+    Returns a list of (job, message_text) tuples.
+    """
+    messages = []
+
+    for job in jobs:
+        title = job["title"]
+        company = job["company"]
+        location = job["location"]
+        publisher = job["publisher"]
+
+        # Very short, easy-to-paste outreach
+        msg = (
+            f"Hi {{Name}},\n\n"
+            f"I came across the *{title}* role at *{company}* in {location} "
+            f"(saw it via {publisher}). I have 2–5 years of experience with "
+            f"AWS, Kubernetes, Docker, Terraform and CI/CD (GitHub Actions) "
+            f"building and operating cloud-native systems.\n\n"
+            f"I'd love to explore whether my DevOps/SRE background could be a "
+            f"good fit for the team. If you’re the right person for this role "
+            f"or can connect me with the hiring manager, I’d really appreciate it.\n\n"
+            f"Best,\n"
+            f"{candidate_name}\n"
+        )
+
+        messages.append((job, msg))
+
+    return messages
+
+
+def write_report_file(jobs, email_body, linkedin_messages):
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+        f.write("=== EMAIL SUMMARY (paste this into Gmail) ===\n\n")
+        f.write(email_body)
+        f.write("\n\n\n=== LINKEDIN OUTREACH MESSAGES ===\n\n")
+
+        if not linkedin_messages:
+            f.write("No jobs -> no LinkedIn messages.\n")
+            return
+
+        for idx, (job, msg) in enumerate(linkedin_messages, start=1):
+            header = (
+                f"[{idx}] {job['title']} – {job['company']} "
+                f"({job['location']})\n"
+                f"Apply: {job['apply_link']}\n\n"
+            )
+            f.write(header)
+            f.write(indent(msg, "    "))
+            f.write("\n" + "-" * 60 + "\n\n")
+
+
+# ========= MAIN =========
+
+def main():
+    print("[INFO] Collecting jobs...")
+    jobs = collect_jobs()
+    print(f"[INFO] Found {len(jobs)} jobs after filtering.")
+
+    email_body = generate_email_body(jobs)
+    linkedin_messages = generate_linkedin_messages(jobs)
+
+    write_report_file(jobs, email_body, linkedin_messages)
+    print(f"[INFO] Report written to {OUTPUT_FILE}")
+
 
 if __name__ == "__main__":
     main()
